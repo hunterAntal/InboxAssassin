@@ -1,0 +1,12 @@
+{
+  "blocked_domains": [
+    "newsletters.example.com",
+    "promo.somestore.com",
+    "noreply.marketing.com"
+  ],
+  "blocked_keywords": [
+    "unsubscribe",
+    "weekly digest",
+    "limited time offer"
+  ]
+}

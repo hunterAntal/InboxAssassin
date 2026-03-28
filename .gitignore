@@ -1,0 +1,32 @@
+# Credentials & tokens
+credentials.json
+token*.json
+client_secret_*.json
+gemini_api_key.txt
+.env
+
+# Personal data / runtime state
+accounts.json
+processed.json
+activity_log.json
+email_log.json
+rate_limit_state.json
+input.txt
+output.txt
+
+# Performance logs & charts
+tally_log*.csv
+tally_graph.png
+graphs/
+
+# Internal AI tooling
+CLAUDE.md
+.claude/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+*.text

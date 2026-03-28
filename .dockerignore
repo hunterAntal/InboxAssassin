@@ -1,0 +1,22 @@
+# Secrets — never bake these into the image
+.env
+token.json
+credentials.json
+gemini_api_key.txt
+client_secret_*.json
+
+# Runtime data files — persisted in GCS on cloud, local-only otherwise
+processed.json
+activity_log.json
+email_log.json
+email_log.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Docker / GCP config (not needed inside the container)
+docker-compose.yml
+.dockerignore
+gcp_setup.sh

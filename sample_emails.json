@@ -1,0 +1,50 @@
+[
+  {
+    "message_id": "sample_001",
+    "sender": "Prof. Linda Marsh <l.marsh@university.edu>",
+    "subject": "COMP 3420 — Final Project Submission Reminder",
+    "date": "Wed, 25 Mar 2026 09:15:00 -0400",
+    "snippet": "Hi everyone, just a reminder that your final project is due this Friday, March 27th by 11:59 PM. Please subm",
+    "body": "Hi everyone,\n\nJust a reminder that your final project is due this Friday, March 27th by 11:59 PM. Please submit a ZIP file containing your source code, a README, and your written report to the course portal.\n\nLate submissions will be penalized 10% per day. If you are experiencing technical difficulties, email me before the deadline — not after.\n\nGood luck,\nProf. Marsh"
+  },
+  {
+    "message_id": "sample_002",
+    "sender": "Dr. Kevin Osei <k.osei@university.edu>",
+    "subject": "Advising Appointment Confirmation — Thursday 2:00 PM",
+    "date": "Tue, 24 Mar 2026 14:30:00 -0400",
+    "snippet": "Hi Hunter, this is a confirmation of your academic advising appointment on Thursday, March 26th at 2:00 PM in",
+    "body": "Hi Hunter,\n\nThis is a confirmation of your academic advising appointment on Thursday, March 26th at 2:00 PM in my office, Burnside Hall Room 512.\n\nWe'll be reviewing your course selection for next semester and discussing your progress toward your degree requirements. Please bring a printed copy of your unofficial transcript.\n\nSee you then,\nDr. Osei\nAcademic Advisor, Department of Computer Science"
+  },
+  {
+    "message_id": "sample_003",
+    "sender": "Registrar's Office <registrar@university.edu>",
+    "subject": "Action Required: Course Registration Opens March 30",
+    "date": "Mon, 23 Mar 2026 08:00:00 -0400",
+    "snippet": "Dear Hunter, course registration for the Fall 2026 semester opens on Monday, March 30th at 8:00 AM. Your reg",
+    "body": "Dear Hunter,\n\nCourse registration for the Fall 2026 semester opens on Monday, March 30th at 8:00 AM. Your registration time slot is 8:00 AM — you are in the first group.\n\nPlease log in to the Student Portal and prepare your course selections in advance. Popular courses fill up quickly. Make sure any holds on your account are cleared before your registration window opens.\n\nFor questions, contact the Registrar's Office at registrar@university.edu.\n\nRegards,\nRegistrar's Office"
+  },
+  {
+    "message_id": "sample_004",
+    "sender": "Alex Nguyen <a.nguyen@university.edu>",
+    "subject": "Study session tonight? — MATH 2150 midterm",
+    "date": "Wed, 25 Mar 2026 16:45:00 -0400",
+    "snippet": "Hey Hunter, a few of us are meeting in the library tonight at 7pm to go over the practice problems for the M",
+    "body": "Hey Hunter,\n\nA few of us are meeting in the library tonight at 7:00 PM to go over the practice problems for the MATH 2150 midterm tomorrow. We'll be in the group study room on the 3rd floor (Room 302).\n\nWe're planning to work through chapters 6–9 and go over last year's exam. Let me know if you can make it!\n\nAlex"
+  },
+  {
+    "message_id": "sample_spam_001",
+    "sender": "Domino's Deals <noreply@deals.dominos.ca>",
+    "subject": "50% off your next order — tonight only!",
+    "date": "Wed, 25 Mar 2026 12:00:00 -0400",
+    "snippet": "Use code SAVE50 at checkout. Order now and get half off your next Domino's order. Limited time offer!",
+    "body": "Use code SAVE50 at checkout. Order now and get half off your next Domino's order. Limited time offer! Order online at dominos.ca."
+  },
+  {
+    "message_id": "sample_005",
+    "sender": "Financial Aid Office <finaid@university.edu>",
+    "subject": "Urgent: Bursary Application Deadline — April 1",
+    "date": "Wed, 25 Mar 2026 11:00:00 -0400",
+    "snippet": "Dear Hunter, this is a reminder that the deadline to submit your bursary application for the upcoming semeste",
+    "body": "Dear Hunter,\n\nThis is a reminder that the deadline to submit your bursary application for the upcoming semester is March 31st, 2026. Applications submitted after this date will not be considered.\n\nTo apply, log in to the Student Financial Aid Portal and complete the bursary application form. You will need to upload proof of enrollment and a brief personal statement.\n\nIf you have already submitted your application, no further action is required.\n\nFor assistance, contact our office at finaid@university.edu or call 514-555-0192.\n\nSincerely,\nFinancial Aid Office"
+  }
+]

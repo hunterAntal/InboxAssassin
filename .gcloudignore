@@ -1,0 +1,20 @@
+# Inherit all gitignore rules
+.gcloudignore
+.gitignore
+
+# Not needed at runtime in the container
+tests/
+sample_emails.json
+plot_tally.py
+gcp_setup.sh
+README.md
+CLAUDE.md
+graphs/
+input.txt
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+*.text
+tally_log.csv

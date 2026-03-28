@@ -1,0 +1,93 @@
+INBOXASSASSIN — COMMAND REFERENCE
+==================================
+
+LOCAL DEVELOPMENT
+-----------------
+python3 fetch_emails.py          Authenticate with Gmail and print the latest unread emails
+python3 analyze_emails.py        Run the full pipeline once (fetch → analyze → calendar/tasks → inbox)
+python3 run_all.py               Loop the pipeline until the inbox is empty
+
+TESTING
+-------
+python3 -m pytest tests/test_all.py -v       Run all unit tests (verbose)
+python3 -m pytest tests/test_all.py -q       Run all unit tests (summary only)
+python3 -m pytest tests/test_all.py -x       Stop on first failure
+
+SAMPLE DATA (no Gmail API calls)
+---------------------------------
+USE_SAMPLE_DATA=true python3 analyze_emails.py    Run pipeline against sample_emails.json
+
+SWITCH AI BACKEND
+-----------------
+Edit MODEL_BACKEND in .env:
+  MODEL_BACKEND=local     Use local Ollama (no rate limits, good for inbox cleanup)
+  MODEL_BACKEND=gemini    Use Google Gemini API (requires GEMINI_API_KEY, good for maintenance)
+
+OLLAMA (local mode)
+--------------------
+ollama serve                                 Start the Ollama server (run in a separate terminal)
+ollama pull gemma3:4b                        Pull the recommended model
+ollama list                                  List downloaded models
+
+BUILD & TEST DOCKER IMAGE LOCALLY
+----------------------------------
+docker build -t inbox-assassin .                Build the container image
+docker run --env-file .env inbox-assassin       Run the container locally
+
+GCP DEPLOYMENT (build → update → execute)
+------------------------------------------
+gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/inbox-assassin --project=YOUR_PROJECT_ID
+gcloud run jobs update inbox-assassin --image=gcr.io/YOUR_PROJECT_ID/inbox-assassin:latest --region=us-central1 --project=YOUR_PROJECT_ID
+gcloud run jobs execute inbox-assassin --region=us-central1 --wait --project=YOUR_PROJECT_ID
+
+GCP ONE-TIME SETUP
+------------------
+PROJECT_ID=YOUR_PROJECT_ID REGION=us-central1 bash gcp_setup.sh
+
+GCP JOB MANAGEMENT
+-------------------
+gcloud run jobs executions list --job=inbox-assassin --region=us-central1 --project=YOUR_PROJECT_ID
+gcloud scheduler jobs pause  inbox-assassin-schedule --location=us-central1 --project=YOUR_PROJECT_ID
+gcloud scheduler jobs resume inbox-assassin-schedule --location=us-central1 --project=YOUR_PROJECT_ID
+
+GCP LOGS
+--------
+gcloud logging read 'resource.type=cloud_run_job AND resource.labels.job_name="inbox-assassin"' --project=YOUR_PROJECT_ID --limit=30 --format="value(textPayload)" --order=asc --freshness=5m
+
+GCP AUTH
+--------
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project YOUR_PROJECT_ID
+rm token.json && python3 fetch_emails.py     Force Gmail re-authentication (e.g. after scope changes)
+
+UPDATE SECRETS ON GCP
+----------------------
+gcloud secrets versions add gmail-token       --data-file=token.json        Re-upload Gmail token
+gcloud secrets versions add gmail-credentials --data-file=credentials.json  Re-upload OAuth credentials
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

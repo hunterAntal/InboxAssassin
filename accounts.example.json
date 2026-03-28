@@ -1,0 +1,21 @@
+[
+  {
+    "id": "gmail-personal",
+    "provider": "gmail",
+    "active": true,
+    "token_file": "token.json"
+  },
+  {
+    "id": "gmail-work",
+    "provider": "gmail",
+    "active": false,
+    "token_file": "token_work.json"
+  },
+  {
+    "id": "hotmail-personal",
+    "provider": "outlook",
+    "active": false,
+    "client_id": "YOUR_AZURE_APP_CLIENT_ID",
+    "tenant_id": "consumers"
+  }
+]
