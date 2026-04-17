@@ -6,6 +6,7 @@ from unittest import mock
 from pre_filter import (
     load_filter_config,
     _extract_domain,
+    _extract_address,
     matches_filter,
     make_filtered_result,
     learn_from_results,
@@ -13,7 +14,8 @@ from pre_filter import (
 )
 
 SAMPLE_CONFIG = {
-    "sender_domains": ["chess.com", "deals.dominos.ca"],
+    "sender_addresses": ["noreply@deals.dominos.ca"],
+    "sender_domains": ["chess.com"],
     "subject_keywords": ["% off", "flash sale"],
 }
 
@@ -35,7 +37,32 @@ class TestExtractDomain:
         assert _extract_domain("") == ""
 
 
+class TestExtractAddress:
+    def test_display_name_format(self):
+        assert _extract_address("Deals <noreply@deals.dominos.ca>") == "noreply@deals.dominos.ca"
+
+    def test_bare_address(self):
+        assert _extract_address("noreply@chess.com") == "noreply@chess.com"
+
+    def test_case_insensitive(self):
+        assert _extract_address("Name <User@Chess.COM>") == "user@chess.com"
+
+    def test_malformed_returns_empty(self):
+        assert _extract_address("not-an-email") == ""
+
+    def test_empty_string(self):
+        assert _extract_address("") == ""
+
+
 class TestMatchesFilter:
+    def test_matches_sender_address(self):
+        email = {"sender": "Deals <noreply@deals.dominos.ca>", "subject": "Your order"}
+        assert matches_filter(email, SAMPLE_CONFIG) is True
+
+    def test_does_not_match_different_address_same_domain(self):
+        email = {"sender": "Deals <other@deals.dominos.ca>", "subject": "Your order"}
+        assert matches_filter(email, SAMPLE_CONFIG) is False
+
     def test_matches_sender_domain(self):
         email = {"sender": "Chess <noreply@chess.com>", "subject": "Your game"}
         assert matches_filter(email, SAMPLE_CONFIG) is True
@@ -54,7 +81,7 @@ class TestMatchesFilter:
 
     def test_empty_config_never_matches(self):
         email = {"sender": "noreply@chess.com", "subject": "flash sale"}
-        assert matches_filter(email, {"sender_domains": [], "subject_keywords": []}) is False
+        assert matches_filter(email, {"sender_addresses": [], "sender_domains": [], "subject_keywords": []}) is False
 
     def test_missing_sender_key(self):
         email = {"subject": "Your game"}
@@ -63,7 +90,7 @@ class TestMatchesFilter:
 
 class TestLoadFilterConfig:
     def test_returns_config_when_file_exists(self, tmp_path, monkeypatch):
-        config = {"sender_domains": ["spam.com"], "subject_keywords": ["buy now"]}
+        config = {"sender_addresses": ["a@spam.com"], "sender_domains": [], "subject_keywords": ["buy now"]}
         config_file = tmp_path / "filter_config.json"
         config_file.write_text(json.dumps(config))
         monkeypatch.chdir(tmp_path)
@@ -117,15 +144,15 @@ class TestLearnFromResults:
         }
         return (email, info)
 
-    def test_adds_new_domain_when_ai_assigns_priority_1(self, tmp_path, monkeypatch):
+    def test_adds_new_address_when_ai_assigns_priority_1(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         results = [self._make_result("Spam <noreply@newspam.com>", priority=1)]
         count = learn_from_results(results)
         assert count == 1
         config = json.loads((tmp_path / "filter_config.json").read_text())
-        assert "newspam.com" in config["sender_domains"]
+        assert "noreply@newspam.com" in config["sender_addresses"]
 
-    def test_does_not_add_pre_filtered_domains(self, tmp_path, monkeypatch):
+    def test_does_not_add_pre_filtered_addresses(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         results = [self._make_result("Spam <noreply@chess.com>", priority=1, pre_filtered=True)]
         count = learn_from_results(results)
@@ -137,9 +164,9 @@ class TestLearnFromResults:
         count = learn_from_results(results)
         assert count == 0
 
-    def test_does_not_add_duplicate_domain(self, tmp_path, monkeypatch):
+    def test_does_not_add_duplicate_address(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        config = {"sender_domains": ["existing.com"], "subject_keywords": []}
+        config = {"sender_addresses": ["a@existing.com"], "subject_keywords": []}
         (tmp_path / "filter_config.json").write_text(json.dumps(config))
         results = [self._make_result("A <a@existing.com>", priority=1)]
         count = learn_from_results(results)

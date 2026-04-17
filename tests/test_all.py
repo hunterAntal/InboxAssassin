@@ -13,7 +13,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fetch_emails import _get_header, _decode_body, fetch_unread_emails
+from fetch_emails import _get_header, _decode_body, fetch_unprocessed_emails
 from analyze_emails import (
     _normalize_time,
     _parse_response,
@@ -21,14 +21,14 @@ from analyze_emails import (
     _read_json,
     _write_json,
     _append_to_json_file,
-    load_processed,
-    save_processed,
     log_emails,
     log_activity,
     analyze_emails,
     create_entries,
     manage_inbox,
     _get_or_create_label,
+    _event_exists,
+    _task_exists,
 )
 from run_all import cloud_init
 
@@ -173,10 +173,10 @@ class TestDecodeBody:
         assert result == ""
 
 
-class TestFetchUnreadEmails:
-    """Tests for fetch_unread_emails function."""
+class TestFetchUnprocessedEmails:
+    """Tests for fetch_unprocessed_emails function."""
 
-    def test_fetch_unread_emails_with_sample_data(self, monkeypatch, tmp_path_env):
+    def test_fetch_unprocessed_emails_with_sample_data(self, monkeypatch, tmp_path_env):
         """Test fetching from sample file when USE_SAMPLE_DATA=true."""
         monkeypatch.setenv("USE_SAMPLE_DATA", "true")
 
@@ -195,25 +195,25 @@ class TestFetchUnreadEmails:
             json.dump(sample_data, f)
 
         service = mock.MagicMock()
-        result = fetch_unread_emails(service)
+        result = fetch_unprocessed_emails(service)
 
         assert result == sample_data
         # Verify API was not called
         service.users().messages().list.assert_not_called()
 
-    def test_fetch_unread_emails_no_messages(self, mock_gmail_service, monkeypatch):
-        """Test when no unread messages are found."""
+    def test_fetch_unprocessed_emails_no_messages(self, mock_gmail_service, monkeypatch):
+        """Test when no processable messages are found."""
         monkeypatch.setenv("USE_SAMPLE_DATA", "false")
 
         mock_gmail_service.users().messages().list().execute.return_value = {
             "messages": []
         }
 
-        result = fetch_unread_emails(mock_gmail_service)
+        result = fetch_unprocessed_emails(mock_gmail_service)
         assert result == []
 
-    def test_fetch_unread_emails_one_message(self, mock_gmail_service, monkeypatch):
-        """Test fetching a single unread email."""
+    def test_fetch_unprocessed_emails_one_message(self, mock_gmail_service, monkeypatch):
+        """Test fetching a single processable email."""
         monkeypatch.setenv("USE_SAMPLE_DATA", "false")
 
         text = "Test email body"
@@ -234,13 +234,27 @@ class TestFetchUnreadEmails:
             "snippet": "fallback"
         }
 
-        result = fetch_unread_emails(mock_gmail_service)
+        result = fetch_unprocessed_emails(mock_gmail_service)
 
         assert len(result) == 1
         assert result[0]["message_id"] == "msg_123"
         assert result[0]["sender"] == "alice@example.com"
         assert result[0]["subject"] == "Test Subject"
         assert result[0]["body"] == text
+
+    def test_fetch_unprocessed_emails_uses_label_query(self, mock_gmail_service, monkeypatch):
+        """Test that the fetch uses q= to exclude AI Processed, not labelIds UNREAD."""
+        monkeypatch.setenv("USE_SAMPLE_DATA", "false")
+
+        mock_gmail_service.users().messages().list().execute.return_value = {"messages": []}
+
+        fetch_unprocessed_emails(mock_gmail_service)
+
+        call_kwargs = mock_gmail_service.users().messages().list.call_args
+        assert "q" in call_kwargs.kwargs
+        assert "in:all" in call_kwargs.kwargs["q"]
+        assert "AI Processed" in call_kwargs.kwargs["q"]
+        assert "labelIds" not in call_kwargs.kwargs
 
 
 # ============================================================================
@@ -517,24 +531,6 @@ class TestAppendToJsonFile:
         assert result == [{"id": 1}, {"id": 2}, {"id": 3}]
 
 
-class TestLoadSaveProcessed:
-    """Tests for load_processed and save_processed functions."""
-
-    def test_load_save_processed_round_trip(self, tmp_path_env):
-        """Test saving and loading processed email IDs."""
-        ids = {"msg_1", "msg_2", "msg_3"}
-
-        save_processed(ids)
-        loaded = load_processed()
-
-        assert loaded == ids
-
-    def test_load_processed_empty_file(self, tmp_path_env):
-        """Test loading processed IDs when file doesn't exist."""
-        result = load_processed()
-        assert result == set()
-
-
 class TestLogEmails:
     """Tests for log_emails function."""
 
@@ -630,7 +626,7 @@ class TestAnalyzeEmails:
         em, info = results[0]
         assert em == sample_email
         assert info == sample_analysis
-        mock_ollama.assert_called_once_with(sample_email)
+        mock_ollama.assert_called_once_with(sample_email, None, None, account_id=None)
 
     @mock.patch("analyze_emails._analyze_with_gemini")
     @mock.patch("time.sleep")
@@ -646,7 +642,7 @@ class TestAnalyzeEmails:
         em, info = results[0]
         assert em == sample_email
         assert info == sample_analysis
-        mock_gemini.assert_called_once_with(sample_email, mock.ANY)
+        assert mock_gemini.call_args[0][0] == sample_email
 
     @mock.patch("analyze_emails._analyze_with_ollama")
     def test_analyze_emails_handles_exception(self, mock_ollama, monkeypatch, sample_email):
@@ -666,9 +662,10 @@ class TestAnalyzeEmails:
 class TestCreateEntries:
     """Tests for create_entries function."""
 
+    @mock.patch("analyze_emails._task_exists", return_value=False)
     @mock.patch("analyze_emails.get_tasks_service")
     @mock.patch("analyze_emails.get_calendar_service")
-    def test_create_entries_creates_task(self, mock_cal_svc, mock_task_svc, tmp_path_env, sample_email):
+    def test_create_entries_creates_task(self, mock_cal_svc, mock_task_svc, mock_task_exists, tmp_path_env, sample_email):
         """Test creating a task from an actionable email."""
         analysis = {
             "priority": 3,
@@ -688,9 +685,10 @@ class TestCreateEntries:
         call_args = mock_task_svc.return_value.tasks().insert.call_args
         assert call_args[1]["tasklist"] == "@default"
 
+    @mock.patch("analyze_emails._event_exists", return_value=False)
     @mock.patch("analyze_emails.get_tasks_service")
     @mock.patch("analyze_emails.get_calendar_service")
-    def test_create_entries_creates_event(self, mock_cal_svc, mock_task_svc, tmp_path_env, sample_email, sample_analysis):
+    def test_create_entries_creates_event(self, mock_cal_svc, mock_task_svc, mock_event_exists, tmp_path_env, sample_email, sample_analysis):
         """Test creating a calendar event from an actionable email."""
         results = [(sample_email, sample_analysis)]
 
@@ -699,32 +697,6 @@ class TestCreateEntries:
         mock_cal_svc.return_value.events().insert.assert_called_once()
         call_args = mock_cal_svc.return_value.events().insert.call_args
         assert call_args[1]["calendarId"] == "primary"
-
-    @mock.patch("analyze_emails.get_tasks_service")
-    @mock.patch("analyze_emails.get_calendar_service")
-    def test_create_entries_skips_already_processed(self, mock_cal_svc, mock_task_svc, tmp_path_env, sample_email, sample_analysis):
-        """Test that already-processed emails are skipped."""
-        # Save the email ID as processed
-        save_processed({"msg_123"})
-
-        results = [(sample_email, sample_analysis)]
-
-        create_entries(results)
-
-        # Services should not be called
-        mock_task_svc.return_value.tasks().insert.assert_not_called()
-        mock_cal_svc.return_value.events().insert.assert_not_called()
-
-    @mock.patch("analyze_emails.get_tasks_service")
-    @mock.patch("analyze_emails.get_calendar_service")
-    def test_create_entries_saves_processed(self, mock_cal_svc, mock_task_svc, tmp_path_env, sample_email, sample_analysis):
-        """Test that processed IDs are saved after creating entries."""
-        results = [(sample_email, sample_analysis)]
-
-        create_entries(results)
-
-        processed = load_processed()
-        assert "msg_123" in processed
 
     def test_create_entries_no_actionable_items(self, tmp_path_env, sample_email):
         """Test when there are no actionable items."""
@@ -740,6 +712,50 @@ class TestCreateEntries:
 
         # Should not raise an error
         create_entries(results)
+
+    @mock.patch("analyze_emails.get_tasks_service")
+    @mock.patch("analyze_emails.get_calendar_service")
+    def test_create_entries_skips_duplicate_event(self, mock_cal_svc, mock_task_svc, tmp_path_env, sample_email, sample_analysis):
+        """Duplicate calendar event (same message_id already in calendar) is skipped."""
+        with mock.patch("analyze_emails._event_exists", return_value=True) as mock_exists:
+            results = [(sample_email, sample_analysis)]
+            create_entries(results)
+            mock_exists.assert_called_once()
+            mock_cal_svc.return_value.events.return_value.insert.assert_not_called()
+
+    @mock.patch("analyze_emails.get_tasks_service")
+    @mock.patch("analyze_emails.get_calendar_service")
+    def test_create_entries_embeds_source_tag(self, mock_cal_svc, mock_task_svc, tmp_path_env, sample_email, sample_analysis):
+        """Newly created calendar event description contains [source:<message_id>]."""
+        with mock.patch("analyze_emails._event_exists", return_value=False):
+            results = [(sample_email, sample_analysis)]
+            create_entries(results)
+            insert_call = mock_cal_svc.return_value.events.return_value.insert.call_args
+            description = insert_call[1]["body"]["description"]
+            assert f"[source:{sample_email['message_id']}]" in description
+
+    @mock.patch("analyze_emails.get_tasks_service")
+    @mock.patch("analyze_emails.get_calendar_service")
+    def test_create_entries_skips_duplicate_task(self, mock_cal_svc, mock_task_svc, tmp_path_env, sample_email, sample_analysis):
+        """Duplicate task (same message_id already in tasks) is skipped."""
+        task_analysis = {**sample_analysis, "action_type": "task"}
+        with mock.patch("analyze_emails._task_exists", return_value=True) as mock_exists:
+            results = [(sample_email, task_analysis)]
+            create_entries(results)
+            mock_exists.assert_called_once()
+            mock_task_svc.return_value.tasks.return_value.insert.assert_not_called()
+
+    @mock.patch("analyze_emails.get_tasks_service")
+    @mock.patch("analyze_emails.get_calendar_service")
+    def test_create_entries_embeds_source_tag_in_task(self, mock_cal_svc, mock_task_svc, tmp_path_env, sample_email, sample_analysis):
+        """Newly created task notes contains [source:<message_id>]."""
+        task_analysis = {**sample_analysis, "action_type": "task"}
+        with mock.patch("analyze_emails._task_exists", return_value=False):
+            results = [(sample_email, task_analysis)]
+            create_entries(results)
+            insert_call = mock_task_svc.return_value.tasks.return_value.insert.call_args
+            notes = insert_call[1]["body"]["notes"]
+            assert f"[source:{sample_email['message_id']}]" in notes
 
 
 class TestManageInbox:
@@ -871,12 +887,11 @@ class TestCloudInit:
         monkeypatch.delenv("GCP_PROJECT", raising=False)
 
         # Should not raise an error
-        cloud_init({"id": "gmail-personal", "provider": "gmail", "active": True})
+        cloud_init({"id": "gmail-personal"})
 
     def test_cloud_init_fetches_secrets(self, monkeypatch, tmp_path_env):
         """Test cloud_init fetches secrets from Secret Manager."""
         monkeypatch.setenv("GCP_PROJECT", "test-project")
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
         # Mock the entire secretmanager module
         mock_secret_client = mock.MagicMock()
@@ -890,10 +905,10 @@ class TestCloudInit:
         )
 
         with mock.patch.dict("sys.modules", {"google.cloud.secretmanager": mock_secret_client}):
-            cloud_init({"id": "gmail-personal", "provider": "gmail", "active": True})
+            cloud_init({"id": "gmail-personal"})
 
-        # Verify it tried to fetch the secrets
-        assert mock_client.access_secret_version.call_count >= 3
+        # Verify it tried to fetch the secrets (token + credentials; gemini key is conditional)
+        assert mock_client.access_secret_version.call_count >= 2
 
     def test_cloud_init_writes_files(self, monkeypatch, tmp_path_env):
         """Test cloud_init writes token.json and credentials.json."""
@@ -917,7 +932,7 @@ class TestCloudInit:
         mock_client.access_secret_version.side_effect = side_effect
 
         with mock.patch.dict("sys.modules", {"google.cloud.secretmanager": mock_secret_client}):
-            cloud_init({"id": "gmail-personal", "provider": "gmail", "active": True})
+            cloud_init({"id": "gmail-personal"})
 
         assert os.path.exists("token.json")
         assert os.path.exists("credentials.json")
@@ -969,20 +984,86 @@ class TestEndToEnd:
             activity_log = json.load(f)
         assert len(activity_log) == 1
 
-    def test_processed_ids_persistence(self, tmp_path_env):
-        """Test that processed IDs persist across save/load cycles."""
-        ids1 = {"msg_1", "msg_2"}
-        save_processed(ids1)
+# ============================================================================
+# Tests for _event_exists and _task_exists
+# ============================================================================
 
-        loaded1 = load_processed()
-        assert loaded1 == ids1
 
-        ids2 = loaded1 | {"msg_3"}
-        save_processed(ids2)
+class TestEventExists:
+    """Tests for _event_exists() helper."""
 
-        loaded2 = load_processed()
-        assert loaded2 == {"msg_1", "msg_2", "msg_3"}
+    def test_returns_false_when_no_events(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.events.return_value.list.return_value.execute.return_value = {"items": []}
+        assert _event_exists(mock_svc, "msg_123", "2026-03-30") is False
 
+    def test_returns_true_when_tag_found_in_description(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.events.return_value.list.return_value.execute.return_value = {
+            "items": [{"description": "From: alice@example.com\n\nMeeting.\n\n[source:msg_123]"}]
+        }
+        assert _event_exists(mock_svc, "msg_123", "2026-03-30") is True
+
+    def test_returns_false_when_different_message_id(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.events.return_value.list.return_value.execute.return_value = {
+            "items": [{"description": "From: alice@example.com\n\nMeeting.\n\n[source:msg_999]"}]
+        }
+        assert _event_exists(mock_svc, "msg_123", "2026-03-30") is False
+
+    def test_returns_false_when_description_is_none(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.events.return_value.list.return_value.execute.return_value = {
+            "items": [{"description": None}]
+        }
+        assert _event_exists(mock_svc, "msg_123", "2026-03-30") is False
+
+    def test_uses_one_year_time_window(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.events.return_value.list.return_value.execute.return_value = {"items": []}
+        _event_exists(mock_svc, "msg_123", "2026-03-30")
+        call_kwargs = mock_svc.events.return_value.list.call_args[1]
+        assert "timeMin" in call_kwargs
+        assert "timeMax" in call_kwargs
+        assert call_kwargs["q"] == "msg_123"
+
+
+class TestTaskExists:
+    """Tests for _task_exists() helper."""
+
+    def test_returns_false_when_no_tasks(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.tasks.return_value.list.return_value.execute.return_value = {"items": []}
+        assert _task_exists(mock_svc, "msg_123") is False
+
+    def test_returns_true_when_tag_found_in_notes(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.tasks.return_value.list.return_value.execute.return_value = {
+            "items": [{"notes": "From: alice@example.com\n\nDo the thing.\n\n[source:msg_123]"}]
+        }
+        assert _task_exists(mock_svc, "msg_123") is True
+
+    def test_returns_false_when_different_message_id(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.tasks.return_value.list.return_value.execute.return_value = {
+            "items": [{"notes": "From: alice@example.com\n\nDo the thing.\n\n[source:msg_999]"}]
+        }
+        assert _task_exists(mock_svc, "msg_123") is False
+
+    def test_returns_false_when_notes_is_none(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.tasks.return_value.list.return_value.execute.return_value = {
+            "items": [{"notes": None}]
+        }
+        assert _task_exists(mock_svc, "msg_123") is False
+
+    def test_paginates_through_all_tasks(self):
+        mock_svc = mock.MagicMock()
+        page1 = {"items": [{"notes": "irrelevant"}], "nextPageToken": "tok1"}
+        page2 = {"items": [{"notes": "[source:msg_123]"}]}
+        mock_svc.tasks.return_value.list.return_value.execute.side_effect = [page1, page2]
+        assert _task_exists(mock_svc, "msg_123") is True
+        assert mock_svc.tasks.return_value.list.call_count == 2
 
 # ============================================================================
 # Token sync to Secret Manager
@@ -1028,32 +1109,185 @@ class TestSyncTokenToSecretManager:
         from fetch_emails import _sync_token_to_secret_manager
         _sync_token_to_secret_manager('{"token": "data"}')  # must not raise
 
+        assert "warning" in capsys.readouterr().out.lower()
 
-# ── Preflight tests ──────────────────────────────────────────────────────────
 
-class TestPreflight:
-    def test_creates_filter_config_when_missing(self, tmp_path, monkeypatch):
-        """_preflight_check_configs auto-creates filter_config.json with empty defaults."""
+class TestEventExists:
+    """Tests for _event_exists() helper."""
+
+    def test_returns_false_when_no_events(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.events.return_value.list.return_value.execute.return_value = {"items": []}
+        assert _event_exists(mock_svc, "msg_123", "2026-03-30") is False
+
+    def test_returns_true_when_tag_found_in_description(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.events.return_value.list.return_value.execute.return_value = {
+            "items": [{"description": "From: alice@example.com\n\nMeeting.\n\n[source:msg_123]"}]
+        }
+        assert _event_exists(mock_svc, "msg_123", "2026-03-30") is True
+
+    def test_returns_false_when_different_message_id(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.events.return_value.list.return_value.execute.return_value = {
+            "items": [{"description": "From: alice@example.com\n\nMeeting.\n\n[source:msg_999]"}]
+        }
+        assert _event_exists(mock_svc, "msg_123", "2026-03-30") is False
+
+    def test_returns_false_when_description_is_none(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.events.return_value.list.return_value.execute.return_value = {
+            "items": [{"description": None}]
+        }
+        assert _event_exists(mock_svc, "msg_123", "2026-03-30") is False
+
+    def test_uses_one_year_time_window(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.events.return_value.list.return_value.execute.return_value = {"items": []}
+        _event_exists(mock_svc, "msg_123", "2026-03-30")
+        call_kwargs = mock_svc.events.return_value.list.call_args[1]
+        assert "timeMin" in call_kwargs
+        assert "timeMax" in call_kwargs
+        assert call_kwargs["q"] == "msg_123"
+
+
+class TestTaskExists:
+    """Tests for _task_exists() helper."""
+
+    def test_returns_false_when_no_tasks(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.tasks.return_value.list.return_value.execute.return_value = {"items": []}
+        assert _task_exists(mock_svc, "msg_123") is False
+
+    def test_returns_true_when_tag_found_in_notes(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.tasks.return_value.list.return_value.execute.return_value = {
+            "items": [{"notes": "From: alice@example.com\n\nDo the thing.\n\n[source:msg_123]"}]
+        }
+        assert _task_exists(mock_svc, "msg_123") is True
+
+    def test_returns_false_when_different_message_id(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.tasks.return_value.list.return_value.execute.return_value = {
+            "items": [{"notes": "From: alice@example.com\n\nDo the thing.\n\n[source:msg_999]"}]
+        }
+        assert _task_exists(mock_svc, "msg_123") is False
+
+    def test_returns_false_when_notes_is_none(self):
+        mock_svc = mock.MagicMock()
+        mock_svc.tasks.return_value.list.return_value.execute.return_value = {
+            "items": [{"notes": None}]
+        }
+        assert _task_exists(mock_svc, "msg_123") is False
+
+    def test_paginates_through_all_tasks(self):
+        mock_svc = mock.MagicMock()
+        page1 = {"items": [{"notes": "irrelevant"}], "nextPageToken": "tok1"}
+        page2 = {"items": [{"notes": "[source:msg_123]"}]}
+        mock_svc.tasks.return_value.list.return_value.execute.side_effect = [page1, page2]
+        assert _task_exists(mock_svc, "msg_123") is True
+        assert mock_svc.tasks.return_value.list.call_count == 2
+
+
+class TestAuthResilience:
+    """Tests for auth error handling added to fetch_emails and run_all."""
+
+    def test_refresh_error_local_clears_token_and_reauths(self, monkeypatch, tmp_path):
+        """Revoked token locally: stale file deleted, OAuth flow triggered, fresh token written."""
+        from google.auth.exceptions import RefreshError
+        from fetch_emails import get_gmail_service
+
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "client_secret.json").write_text("{}")
-        (tmp_path / "accounts.json").write_text('[{"id":"x","provider":"gmail","active":true}]')
-        import run_all
-        run_all._preflight_check_configs()
-        assert (tmp_path / "filter_config.json").exists()
-        import json
-        data = json.loads((tmp_path / "filter_config.json").read_text())
-        assert data == {"blocked_domains": [], "blocked_keywords": []}
+        monkeypatch.delenv("GCP_PROJECT", raising=False)
+        token_file = tmp_path / "token_test.json"
+        token_file.write_text('{"token": "stale"}')
 
-    def test_creates_accounts_json_interactively(self, tmp_path, monkeypatch):
-        """_preflight_check_configs creates accounts.json using user-supplied email."""
+        stale_creds = mock.MagicMock()
+        stale_creds.valid = False
+        stale_creds.expired = True
+        stale_creds.refresh_token = "rt"
+        stale_creds.refresh.side_effect = RefreshError("invalid_grant")
+
+        fresh_creds = mock.MagicMock()
+        fresh_creds.valid = True
+        fresh_creds.to_json.return_value = '{"token": "fresh"}'
+
+        with mock.patch("fetch_emails.Credentials.from_authorized_user_file", return_value=stale_creds), \
+             mock.patch("fetch_emails.InstalledAppFlow.from_client_secrets_file") as mock_flow, \
+             mock.patch("fetch_emails.build"), \
+             mock.patch("fetch_emails._sync_token_to_secret_manager"):
+            mock_flow.return_value.run_local_server.return_value = fresh_creds
+            get_gmail_service(str(token_file))
+
+        mock_flow.return_value.run_local_server.assert_called_once()
+        assert token_file.read_text() == '{"token": "fresh"}'
+
+    def test_refresh_error_gcp_raises_runtime_error(self, monkeypatch, tmp_path):
+        """Revoked token on GCP: raises RuntimeError instead of trying interactive re-auth."""
+        from google.auth.exceptions import RefreshError
+        from fetch_emails import get_gmail_service
+
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "client_secret.json").write_text("{}")
-        (tmp_path / "filter_config.json").write_text('{"blocked_domains":[],"blocked_keywords":[]}')
-        monkeypatch.setattr("builtins.input", lambda _: "user@gmail.com")
-        import run_all
-        run_all._preflight_check_configs()
-        import json
-        accounts = json.loads((tmp_path / "accounts.json").read_text())
-        assert accounts[0]["id"] == "gmail-user"
-        assert accounts[0]["provider"] == "gmail"
-        assert accounts[0]["active"] is True
+        monkeypatch.setenv("GCP_PROJECT", "my-project")
+        token_file = tmp_path / "token_test.json"
+        token_file.write_text('{"token": "stale"}')
+
+        stale_creds = mock.MagicMock()
+        stale_creds.valid = False
+        stale_creds.expired = True
+        stale_creds.refresh_token = "rt"
+        stale_creds.refresh.side_effect = RefreshError("invalid_grant")
+
+        with mock.patch("fetch_emails.Credentials.from_authorized_user_file", return_value=stale_creds):
+            with pytest.raises(RuntimeError, match="expired/revoked on GCP"):
+                get_gmail_service(str(token_file))
+
+    def test_cloud_init_writes_to_account_token_file(self, monkeypatch, tmp_path):
+        """cloud_init writes the secret to the account-specific token_file, not token.json."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("GCP_PROJECT", "my-project")
+        (tmp_path / "credentials.json").write_text("{}")
+
+        account = {
+            "id": "gmail-work",
+            "token_file": "token_work.json",
+            "token_secret": "gmail-token-work",
+            "credentials_secret": "gmail-credentials",
+        }
+
+        mock_sm = mock.MagicMock()
+        mock_client = mock_sm.SecretManagerServiceClient.return_value
+        mock_client.access_secret_version.side_effect = lambda **kwargs: mock.MagicMock(
+            payload=mock.MagicMock(data=b'{"token": "account-specific"}')
+        )
+
+        with mock.patch.dict("sys.modules", {"google.cloud.secretmanager": mock_sm}):
+            import importlib
+            import run_all as run_all_mod
+            importlib.reload(run_all_mod)
+            run_all_mod.cloud_init(account)
+
+        assert (tmp_path / "token_work.json").read_text() == '{"token": "account-specific"}'
+        assert not (tmp_path / "token.json").exists(), "cloud_init must not write to the default token.json"
+
+    def test_main_continues_after_account_error(self, monkeypatch, capsys):
+        """An exception in one account's pipeline is caught; subsequent accounts still run."""
+        import run_all as run_all_mod
+
+        accounts = [
+            {"id": "gmail-bad",  "provider": "gmail", "active": True},
+            {"id": "gmail-good", "provider": "gmail", "active": True},
+        ]
+        call_log = []
+
+        def fake_process(account):
+            if account["id"] == "gmail-bad":
+                raise RuntimeError("auth failed")
+            call_log.append(account["id"])
+
+        with mock.patch.object(run_all_mod, "load_accounts", return_value=accounts), \
+             mock.patch.object(run_all_mod, "_process_account", side_effect=fake_process):
+            run_all_mod.main()
+
+        assert "gmail-good" in call_log
+        assert "ERROR" in capsys.readouterr().out

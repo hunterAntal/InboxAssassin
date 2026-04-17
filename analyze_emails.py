@@ -21,8 +21,9 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from fetch_emails import get_gmail_service, fetch_unread_emails, TOKEN_FILE, gmail_execute
+from fetch_emails import get_gmail_service, fetch_unprocessed_emails, TOKEN_FILE, gmail_execute
 import pre_filter
+from pre_filter import account_file_path  # sprint 22 — per-account data file isolation
 
 load_dotenv()
 
@@ -55,9 +56,17 @@ INVOICE_LABEL_NAME      = "Invoice"
 SHIPPING_LABEL_NAME     = "Shipping"
 SUBSCRIPTION_LABEL_NAME = "Subscription"
 TRAVEL_LABEL_NAME       = "Travel"
-PROCESSED_FILE       = "processed.json"
+TMMC_LABEL_NAME         = "TMMC"
+AGENT_REPORT_LABEL_NAME = "Agent Report"
 ACTIVITY_LOG_FILE    = "activity_log.json"
 EMAIL_LOG_FILE       = "email_log.json"
+
+DIGEST_MORNING_HOUR = int(os.environ.get("DIGEST_MORNING_HOUR", 9))
+DIGEST_EVENING_HOUR = int(os.environ.get("DIGEST_EVENING_HOUR", 18))
+DIGEST_STATE_FILE   = "agent_digest_state.json"
+AGENT_LOG_BUFFER    = "agent_log_buffer.txt"
+# sprint 22 — [AGENT MODEL] per-account model config file
+MODEL_CONFIG_FILE   = "model_config.json"
 
 PROMPT_TEMPLATE = """Today's date is {today}. Analyze this email and respond ONLY with a valid JSON object — no markdown, no code fences, just raw JSON.
 
@@ -174,13 +183,50 @@ class RateLimiter:
 # AI backends
 # ---------------------------------------------------------------------------
 
-def _analyze_with_gemini(email: dict, limiter: "RateLimiter") -> dict:
+def _build_prompt(
+    email: dict,
+    label_rules: dict | None = None,
+    priority_overrides: list | None = None,
+) -> str:
+    """Build the AI prompt for an email, injecting label rules and priority overrides."""
+    prompt = PROMPT_TEMPLATE.format(
+        sender=email.get("sender", ""),
+        subject=email.get("subject", ""),
+        body=email.get("body", ""),
+        today=date.today().isoformat(),
+    )
+
+    if label_rules:
+        matching_rules = [
+            rule for name, rule in label_rules.items()
+            if name in email.get("label_names", [])
+        ]
+        if matching_rules:
+            injected = "\n".join(f"- {r}" for r in matching_rules)
+            prompt += f"\n\nAdditional instructions for this email's label:\n{injected}"
+
+    if priority_overrides:
+        searchable = (
+            (email.get("subject", "") + " " + email.get("body", "")).lower()
+        )
+        for override in priority_overrides:
+            if override["keyword"] in searchable:
+                prompt += (
+                    f'\n\nPriority override: this email contains the keyword '
+                    f'"{override["keyword"]}" — score it at priority {override["priority"]} '
+                    f'regardless of your normal assessment.'
+                )
+
+    return prompt
+
+
+def _analyze_with_gemini(email: dict, limiter: "RateLimiter", label_rules: dict | None = None, priority_overrides: list | None = None) -> dict:
     from google import genai
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise EnvironmentError("GEMINI_API_KEY not set in .env")
     client = genai.Client(api_key=api_key)
-    prompt = PROMPT_TEMPLATE.format(**email, today=date.today().isoformat())
+    prompt = _build_prompt(email, label_rules, priority_overrides)
 
     max_retries = 3
     for attempt in range(1, max_retries + 1):
@@ -204,12 +250,13 @@ def _analyze_with_gemini(email: dict, limiter: "RateLimiter") -> dict:
                 raise
 
 
-def _analyze_with_ollama(email: dict) -> dict:
+def _analyze_with_ollama(email: dict, label_rules: dict | None = None, priority_overrides: list | None = None, account_id: str | None = None) -> dict:
+    # sprint 22 — use per-account model if set, else env var / default
     import ollama
     client = ollama.Client(host=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
-    prompt = PROMPT_TEMPLATE.format(**email, today=date.today().isoformat())
+    prompt = _build_prompt(email, label_rules, priority_overrides)
     response = client.chat(
-        model=os.environ.get("LOCAL_MODEL", "llama3.1:latest"),
+        model=_get_account_model(account_id),
         messages=[{"role": "user", "content": prompt}],
     )
     return _parse_response(response.message.content)
@@ -246,12 +293,13 @@ def _parse_response(text: str) -> dict:
     }
 
 
-def analyze_emails(emails: list[dict]) -> list[tuple[dict, Optional[dict]]]:
+def analyze_emails(emails: list[dict], label_rules: dict | None = None, priority_overrides: list | None = None, account_id: str | None = None) -> list[tuple[dict, Optional[dict]]]:
     """Run every email through the configured AI backend. Returns (email, analysis) pairs."""
     backend       = os.environ.get("MODEL_BACKEND", "gemini").lower()
     use_gemini    = backend == "gemini"
     use_filter    = os.environ.get("PRE_FILTER", "true").lower() != "false"
-    model_name    = GEMINI_MODEL if use_gemini else os.environ.get("LOCAL_MODEL", "llama3.1:latest")
+    # sprint 22 — use per-account model for display and analysis
+    model_name    = GEMINI_MODEL if use_gemini else _get_account_model(account_id)
     filter_config = pre_filter.load_filter_config() if use_filter else {}
     limiter       = RateLimiter(GEMINI_MODEL) if use_gemini else None
 
@@ -267,10 +315,10 @@ def analyze_emails(emails: list[dict]) -> list[tuple[dict, Optional[dict]]]:
         print(f"  [{i}/{len(emails)}] {em['subject'][:60]}")
         try:
             if use_gemini:
-                info = _analyze_with_gemini(em, limiter)
+                info = _analyze_with_gemini(em, limiter, label_rules, priority_overrides)
                 print(f"         [{limiter.status()}]")
             else:
-                info = _analyze_with_ollama(em)
+                info = _analyze_with_ollama(em, label_rules, priority_overrides, account_id=account_id)
         except RuntimeError as e:
             print(f"  [stopped] {e}")
             break
@@ -326,16 +374,13 @@ def _append_to_json_file(path: str, entries: Any) -> None:
     _write_json(path, log)
 
 
-def load_processed() -> set:
-    return set(_read_json(PROCESSED_FILE))
+def log_emails(results: list[tuple[dict, Optional[dict]]], account_id: str | None = None) -> None:
+    """Append every fetched email + analysis to the email log for training data.
 
-
-def save_processed(ids: set) -> None:
-    _write_json(PROCESSED_FILE, list(ids))
-
-
-def log_emails(results: list[tuple[dict, Optional[dict]]]) -> None:
-    """Append every fetched email + analysis to email_log.json for training data."""
+    When account_id is given, writes to email_log_<account_id>.json.
+    """
+    # sprint 22 — per-account email log path
+    path = account_file_path(EMAIL_LOG_FILE, account_id)
     now = datetime.now().isoformat(timespec="seconds")
     records = [
         {
@@ -350,13 +395,18 @@ def log_emails(results: list[tuple[dict, Optional[dict]]]) -> None:
         }
         for em, info in results
     ]
-    _append_to_json_file(EMAIL_LOG_FILE, records)
-    print(f"  {len(records)} email(s) logged to {EMAIL_LOG_FILE}")
+    _append_to_json_file(path, records)
+    print(f"  {len(records)} email(s) logged to {path}")
 
 
-def log_activity(entry_type: str, title: str, event_date: str, event_time: Optional[str], sender: str, subject: str, tldr: str) -> None:
-    """Append one created event/task to activity_log.json."""
-    _append_to_json_file(ACTIVITY_LOG_FILE, {
+def log_activity(entry_type: str, title: str, event_date: str, event_time: Optional[str], sender: str, subject: str, tldr: str, account_id: str | None = None) -> None:
+    """Append one created event/task to the activity log.
+
+    When account_id is given, writes to activity_log_<account_id>.json.
+    """
+    # sprint 22 — per-account activity log path
+    path = account_file_path(ACTIVITY_LOG_FILE, account_id)
+    _append_to_json_file(path, {
         "logged_at": datetime.now().isoformat(timespec="seconds"),
         "type":      entry_type,
         "title":     title,
@@ -390,21 +440,13 @@ def get_tasks_service() -> Any:
 # ---------------------------------------------------------------------------
 
 def _local_tz() -> str:
-    """Return the local IANA timezone name (e.g. 'America/Toronto'), falling back to UTC."""
-    # Prefer explicit TZ env var (set to e.g. America/Toronto in Cloud Run)
-    tz_env = os.environ.get("TZ")
-    if tz_env:
-        return tz_env
+    """Return the local IANA timezone name (e.g. 'America/Toronto'), falling back to UTC offset."""
     try:
         import zoneinfo
-        tz = datetime.now().astimezone().tzinfo
-        # tzinfo.key is set on ZoneInfo objects; str() gives abbreviations like "EDT"
-        key = getattr(tz, "key", None)
-        if key:
-            return key
+        return str(datetime.now().astimezone().tzinfo)
     except Exception:
-        pass
-    return "UTC"
+        tz_offset = datetime.now().astimezone().strftime("%z")
+        return f"UTC{tz_offset[:3]}:{tz_offset[3:]}"
 
 
 def _calendar_event_fields(info: dict) -> tuple[dict, dict, str]:
@@ -440,8 +482,48 @@ def _analyzed(results: list[tuple[dict, Optional[dict]]]) -> list[tuple[dict, di
     return [(em, info) for em, info in results if info is not None]
 
 
-def create_entries(results: list[tuple[dict, Optional[dict]]]) -> None:
-    """Create a Calendar event or Google Task for each actionable email."""
+def _event_exists(calendar_service: Any, message_id: str, event_date: str) -> bool:
+    """Return True if a calendar event tagged [source:<message_id>] already exists."""
+    try:
+        ref = datetime.strptime(event_date, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        ref = datetime.today()
+    time_min = (ref - timedelta(days=365)).isoformat() + "Z"
+    time_max = (ref + timedelta(days=365)).isoformat() + "Z"
+    result = gmail_execute(calendar_service.events().list(
+        calendarId="primary",
+        q=message_id,
+        timeMin=time_min,
+        timeMax=time_max,
+        singleEvents=True,
+    ))
+    tag = f"[source:{message_id}]"
+    return any(tag in (ev.get("description") or "") for ev in result.get("items", []))
+
+
+def _task_exists(tasks_service: Any, message_id: str) -> bool:
+    """Return True if a Google Task tagged [source:<message_id>] already exists."""
+    tag = f"[source:{message_id}]"
+    page_token = None
+    while True:
+        kwargs: dict = {"tasklist": "@default", "showCompleted": True, "showHidden": True}
+        if page_token:
+            kwargs["pageToken"] = page_token
+        result = gmail_execute(tasks_service.tasks().list(**kwargs))
+        for task in result.get("items", []):
+            if tag in (task.get("notes") or ""):
+                return True
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
+    return False
+
+
+def create_entries(results: list[tuple[dict, Optional[dict]]], account_id: str | None = None) -> None:
+    """Create a Calendar event or Google Task for each actionable email.
+
+    When account_id is given, activity is logged to activity_log_<account_id>.json.
+    """
     actionable = [
         (em, info) for em, info in results
         if info and info.get("event_date") and info.get("action_type")
@@ -451,7 +533,6 @@ def create_entries(results: list[tuple[dict, Optional[dict]]]) -> None:
         print("No events or tasks to create.")
         return
 
-    processed        = load_processed()
     calendar_service = get_calendar_service()
     tasks_service    = get_tasks_service()
     new_count        = 0
@@ -461,48 +542,52 @@ def create_entries(results: list[tuple[dict, Optional[dict]]]) -> None:
     print(f"{'='*60}\n")
 
     for em, info in actionable:
-        if em["message_id"] in processed:
-            print(f"  [skip]  {em['subject'][:50]}")
-            continue
-
-        title = info["event_title"] or em["subject"]
+        title      = info["event_title"] or em["subject"]
+        message_id = em["message_id"]
+        source_tag = f"\n\n[source:{message_id}]"
 
         try:
             if info["action_type"] == "task":
+                if _task_exists(tasks_service, message_id):
+                    print(f"  [skip]  already in tasks: {em['subject'][:50]}")
+                    continue
                 gmail_execute(tasks_service.tasks().insert(
                     tasklist="@default",
                     body={
                         "title": title,
-                        "notes": f"From: {em['sender']}\n\n{info['tldr']}",
+                        "notes": f"From: {em['sender']}\n\n{info['tldr']}{source_tag}",
                         "due":   f"{info['event_date']}T00:00:00.000Z",
                     },
                 ))
+                # sprint 22 — pass account_id for per-account activity log
                 log_activity("task", title, info["event_date"], None,
-                             em["sender"], em["subject"], info["tldr"])
+                             em["sender"], em["subject"], info["tldr"], account_id=account_id)
                 print(f"  [task]  {info['event_date']} — {title[:50]}")
 
             else:
+                if _event_exists(calendar_service, message_id, info["event_date"]):
+                    print(f"  [skip]  already in calendar: {em['subject'][:50]}")
+                    continue
                 start, end, time_label = _calendar_event_fields(info)
                 gmail_execute(calendar_service.events().insert(
                     calendarId="primary",
                     body={
                         "summary":     title,
-                        "description": f"From: {em['sender']}\n\n{info['tldr']}",
+                        "description": f"From: {em['sender']}\n\n{info['tldr']}{source_tag}",
                         "start":       start,
                         "end":         end,
                     },
                 ))
+                # sprint 22 — pass account_id for per-account activity log
                 log_activity("event", title, info["event_date"], info["event_time"],
-                             em["sender"], em["subject"], info["tldr"])
+                             em["sender"], em["subject"], info["tldr"], account_id=account_id)
                 print(f"  [event] {info['event_date']} {time_label} — {title[:50]}")
 
-            processed.add(em["message_id"])
             new_count += 1
 
         except HttpError as e:
             print(f"  [error] {em['subject'][:50]}: {e}")
 
-    save_processed(processed)
     print(f"\n{new_count} item(s) created.")
 
 
@@ -539,6 +624,7 @@ def manage_inbox(gmail_service: Any, results: list[tuple[dict, Optional[dict]]])
     subscription_label_id = _get_or_create_label(gmail_service, SUBSCRIPTION_LABEL_NAME)
     travel_label_id       = _get_or_create_label(gmail_service, TRAVEL_LABEL_NAME)
     cloud_label_id        = _get_or_create_label(gmail_service, CLOUD_LABEL_NAME) if os.environ.get("GCP_PROJECT") else None
+    tmmc_label_id         = _get_or_create_label(gmail_service, TMMC_LABEL_NAME)
 
     print(f"\n{'='*60}")
     print(f"  INBOX MANAGEMENT")
@@ -559,6 +645,7 @@ def manage_inbox(gmail_service: Any, results: list[tuple[dict, Optional[dict]]])
             + ([subscription_label_id] if info.get("is_subscription") else [])
             + ([travel_label_id]       if info.get("is_travel") else [])
             + ([cloud_label_id]        if cloud_label_id else [])
+            + ([tmmc_label_id]         if "tmmc-email.toyota.com" in em["sender"].lower() else [])
         )
         remove_labels = ["UNREAD"] + (["INBOX"] if info["priority"] <= ARCHIVE_PRIORITY else [])
         action        = "archived" if info["priority"] <= ARCHIVE_PRIORITY else "marked read"
@@ -623,7 +710,7 @@ def send_digest_email(service: Any, results: list, batch_num: int) -> None:
 
     timestamp = datetime.now().strftime("%b %d, %Y at %I:%M %p")
     subject = (
-        f"InboxAssassin — {timestamp} — Batch {batch_num}: {total} processed"
+        f"Email Agent — {timestamp} — Batch {batch_num}: {total} processed"
         + (f" ({len(action)} action required)" if action else "")
     )
 
@@ -683,6 +770,554 @@ def send_digest_email(service: Any, results: list, batch_num: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Sprint 16 — Twice-daily Agent Report digest
+# ---------------------------------------------------------------------------
+
+def _read_text(path: str) -> str:
+    """Read a text file from local disk or GCS. Returns empty string if missing."""
+    try:
+        bucket = os.environ.get("GCS_BUCKET")
+        if bucket:
+            blob = _gcs_client().bucket(bucket).blob(path)
+            return blob.download_as_text() if blob.exists() else ""
+        if os.path.exists(path):
+            with open(path) as f:
+                return f.read()
+    except Exception as e:
+        print(f"[warning] Could not read {path}: {e}")
+    return ""
+
+
+def _write_text(path: str, content: str) -> None:
+    """Write a text file to local disk or GCS."""
+    bucket = os.environ.get("GCS_BUCKET")
+    if bucket:
+        _gcs_client().bucket(bucket).blob(path).upload_from_string(
+            content, content_type="text/plain"
+        )
+    else:
+        with open(path, "w") as f:
+            f.write(content)
+
+
+def load_digest_state(state_file: str = DIGEST_STATE_FILE) -> dict:
+    """Load last digest send dates from disk/GCS. Missing or corrupt → safe default."""
+    _default = {"last_morning": None, "last_evening": None}
+    try:
+        bucket = os.environ.get("GCS_BUCKET")
+        if bucket:
+            blob = _gcs_client().bucket(bucket).blob(state_file)
+            if blob.exists():
+                return json.loads(blob.download_as_text())
+            return _default
+        if os.path.exists(state_file):
+            with open(state_file) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return _default
+
+
+def save_digest_state(state: dict, state_file: str = DIGEST_STATE_FILE) -> None:
+    """Persist digest send-date state."""
+    _write_json(state_file, state)
+
+
+def should_send_digest(state: dict, now: datetime, tz_name: str = "UTC") -> str | None:
+    """Return 'morning', 'evening', or None based on current time and last-sent state."""
+    import zoneinfo
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = zoneinfo.ZoneInfo("UTC")
+
+    local_now = now.astimezone(tz)
+    today = local_now.date().isoformat()
+
+    # First-ever run — no state at all → send morning immediately
+    if state.get("last_morning") is None and state.get("last_evening") is None:
+        return "morning"
+
+    # Evening threshold check (20:00+)
+    if local_now.hour >= DIGEST_EVENING_HOUR and state.get("last_evening") != today:
+        return "evening"
+
+    # Morning threshold check (08:00+)
+    if local_now.hour >= DIGEST_MORNING_HOUR and state.get("last_morning") != today:
+        return "morning"
+
+    return None
+
+
+def format_run_log(results: list, account_id: str, timestamp: datetime, tz_name: str = "UTC") -> str:
+    """Format a run's digest as a plain-text log string to store in the buffer."""
+    import zoneinfo
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = zoneinfo.ZoneInfo("UTC")
+
+    local_ts = timestamp.astimezone(tz)
+    ts_str = local_ts.strftime("%Y-%m-%d %H:%M %Z")
+    sep = "\u2550" * 60  # ══════
+
+    pre_filtered = sum(1 for _, info in results if info and info.get("pre_filtered"))
+    valid = sorted(
+        [(em, info) for em, info in results if info and not info.get("pre_filtered")],
+        key=lambda x: x[1]["priority"],
+        reverse=True,
+    )
+
+    lines = [
+        f"\n{sep}",
+        f"  Run: {ts_str}  |  Account: {account_id}",
+        f"{sep}",
+        f"EMAIL DIGEST \u2014 {len(valid)} analyzed, {pre_filtered} pre-filtered\n",
+    ]
+    for rank, (em, info) in enumerate(valid, start=1):
+        action_label = "ACTION REQUIRED" if info["action_required"] else "no action"
+        lines += [
+            f"[{rank}] PRIORITY {info['priority']} | {action_label}",
+            f"    From:    {em['sender']}",
+            f"    Subject: {em['subject']}",
+            f"    TL;DR:   {info['tldr']}",
+        ]
+        if info.get("event_date"):
+            lines.append(f"    Event:   {info['event_date']}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def append_run_to_buffer(run_log: str, read_fn=None, write_fn=None, account_id: str | None = None) -> None:
+    """Append a run log to the text buffer (local disk or GCS).
+
+    When account_id is given, uses agent_log_buffer_<account_id>.txt.
+    """
+    # sprint 22 — per-account log buffer path
+    buf_path = account_file_path(AGENT_LOG_BUFFER, account_id)
+    if read_fn is None:
+        read_fn = lambda: _read_text(buf_path)
+    if write_fn is None:
+        write_fn = lambda content: _write_text(buf_path, content)
+    try:
+        existing = read_fn()
+        write_fn(existing + run_log)
+    except Exception as e:
+        print(f"  [digest] Warning: could not append to log buffer: {e}")
+
+
+def build_digest_body(buffer_text: str, period: str, send_time: datetime) -> str:
+    """Build the Agent Report email body from the accumulated log buffer."""
+    date_str = send_time.strftime("%b %d, %Y")
+    period_cap = period.capitalize()
+
+    if not buffer_text.strip():
+        return (
+            f"Agent Log Digest \u2014 {period_cap}, {date_str}\n"
+            f"{'=' * 60}\n"
+            f"No log output recorded since last digest.\n"
+        )
+
+    run_count = buffer_text.count("Run:")
+    header = (
+        f"Agent Log Digest \u2014 {period_cap}, {date_str}\n"
+        f"Runs included: {run_count}\n"
+        f"{'=' * 60}\n"
+    )
+    return header + buffer_text
+
+
+def send_agent_report(service: Any, period: str, body: str, date_str: str) -> None:
+    """Send the Agent Report digest email; apply Agent Report label and star it."""
+    import base64
+    from email.mime.text import MIMEText
+
+    subject = f"[Agent Report] {period.capitalize()} Digest \u2014 {date_str}"
+
+    try:
+        profile = gmail_execute(service.users().getProfile(userId="me"))
+        email_address = profile["emailAddress"]
+
+        msg = MIMEText(body)
+        msg["to"] = email_address
+        msg["subject"] = subject
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        sent = gmail_execute(service.users().messages().send(userId="me", body={"raw": raw}))
+
+        label_id = _get_or_create_label(service, AGENT_REPORT_LABEL_NAME)
+        gmail_execute(service.users().messages().modify(
+            userId="me", id=sent["id"],
+            body={"removeLabelIds": ["UNREAD"], "addLabelIds": ["STARRED", label_id]},
+        ))
+        print(f"  [digest] Agent Report sent \u2014 {subject}")
+    except Exception as e:
+        print(f"  [digest] Could not send Agent Report: {e}")
+
+
+def archive_read_agent_reports(service: Any) -> None:
+    """Archive any read (non-UNREAD) Agent Report emails from the inbox."""
+    try:
+        query = 'label:"Agent Report" in:inbox -is:unread'
+        result = gmail_execute(service.users().messages().list(userId="me", q=query))
+        messages = result.get("messages", [])
+        for msg in messages:
+            gmail_execute(service.users().messages().modify(
+                userId="me", id=msg["id"],
+                body={"removeLabelIds": ["INBOX"], "addLabelIds": []},
+            ))
+        if messages:
+            print(f"  [digest] Archived {len(messages)} read Agent Report email(s)")
+    except Exception as e:
+        print(f"  [digest] Warning: could not archive Agent Report emails: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Sprint 20 — [AGENT STATUS] reply
+# ---------------------------------------------------------------------------
+
+def _extract_last_run(buffer_text: str) -> tuple[str, str]:
+    """Parse the most recent Run: block from the log buffer.
+
+    Returns (timestamp_str, emails_processed_str).
+    Both are 'unknown' if the buffer is empty or unparseable.
+    """
+    if not buffer_text.strip():
+        return "unknown", "unknown"
+
+    # Find all "Run:" lines — last one is most recent
+    run_lines = [ln for ln in buffer_text.splitlines() if ln.strip().startswith("Run:")]
+    if not run_lines:
+        return "unknown", "unknown"
+
+    last_run_line = run_lines[-1].strip()
+    # Format: "Run: 2026-04-13 08:47 EDT  |  Account: gmail-personal"
+    ts_part = last_run_line.removeprefix("Run:").split("|")[0].strip()
+
+    # Find the EMAIL DIGEST line that follows the last Run: block
+    lines = buffer_text.splitlines()
+    last_run_idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("Run:") and ln.strip() == last_run_line:
+            last_run_idx = i
+
+    emails_processed = "unknown"
+    if last_run_idx is not None:
+        for ln in lines[last_run_idx:]:
+            m = re.search(r"(\d+)\s+analyzed", ln)
+            if m:
+                emails_processed = m.group(1)
+                break
+
+    return ts_part, emails_processed
+
+
+def build_status_reply_body(
+    scheduler_line: str,
+    accounts: list,
+    last_run_ts: str,
+    emails_processed: str,
+) -> str:
+    """Build the plain-text [AGENT STATUS] reply body per UX contract."""
+    from datetime import datetime as _dt
+    import os as _os
+
+    sep = "=" * 60
+    now_str = _dt.now().strftime("%b %d, %Y %H:%M")
+
+    backend      = _os.environ.get("MODEL_BACKEND", "gemini")
+    model        = _os.environ.get("GEMINI_MODEL",  GEMINI_MODEL)
+    archive_pri  = _os.environ.get("ARCHIVE_PRIORITY", str(ARCHIVE_PRIORITY))
+    pre_filter_  = "on"  if _os.environ.get("PRE_FILTER",   "true").lower()  != "false" else "off"
+    digest_on    = "on"  if _os.environ.get("SEND_DIGEST",  "true").lower()  != "false" else "off"
+    max_batches  = _os.environ.get("MAX_BATCHES", "0")
+    max_batch_str = "unlimited" if max_batches == "0" else max_batches
+
+    account_lines = "\n".join(
+        f"  • {a.get('email') or a.get('id', '?')}"
+        for a in accounts
+    ) if accounts else "  • (unknown)"
+
+    lines = [
+        f"Agent Status Report — {now_str}",
+        sep,
+        f"Scheduler       : {scheduler_line}",
+        "",
+        f"Model           : {backend} / {model}",
+        f"Archive priority: ≤ {archive_pri} (priority 1–{archive_pri} archived after processing)",
+        f"Pre-filter      : {pre_filter_}",
+        f"Digest emails   : {digest_on}",
+        f"Max batches     : {max_batch_str}",
+        "",
+        f"Accounts monitored ({len(accounts)}):",
+        account_lines,
+        "",
+        f"Last run        : {last_run_ts}",
+        f"Emails processed: {emails_processed}",
+        "",
+        sep,
+        f"Reply to [AGENT STATUS] sent at {_dt.now().strftime('%H:%M')}.",
+    ]
+    return "\n".join(lines)
+
+
+def send_status_reply(service: Any, body: str) -> None:
+    """Send the [AGENT STATUS] reply email; apply Agent Report label and star it."""
+    import base64
+    from email.mime.text import MIMEText
+    from datetime import datetime as _dt
+
+    date_str = _dt.now().strftime("%b %d, %Y")
+    subject  = f"[Agent Status] Report — {date_str}"
+
+    try:
+        profile = gmail_execute(service.users().getProfile(userId="me"))
+        email_address = profile["emailAddress"]
+
+        msg = MIMEText(body)
+        msg["to"]      = email_address
+        msg["subject"] = subject
+
+        raw  = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        sent = gmail_execute(service.users().messages().send(userId="me", body={"raw": raw}))
+
+        label_id = _get_or_create_label(service, AGENT_REPORT_LABEL_NAME)
+        gmail_execute(service.users().messages().modify(
+            userId="me", id=sent["id"],
+            body={"removeLabelIds": ["UNREAD"], "addLabelIds": ["STARRED", label_id]},
+        ))
+        print(f"  [agent-status] Status reply sent — {subject}")
+    except Exception as e:
+        print(f"  [agent-status] Could not send status reply: {e}")
+
+
+def handle_status_commands(
+    service: Any,
+    own_address: str,
+    status_msg_ids: list,
+    is_paused: bool,
+    pause_description: str,
+    accounts: list,
+    read_fn=None,
+) -> None:
+    """For each [AGENT STATUS] command: build reply, send it, consume the command email.
+
+    read_fn is injectable for testing (replaces _read_text on the log buffer).
+    """
+    if not status_msg_ids:
+        return
+
+    print(f"  [agent-status] STATUS command detected — composing reply")
+
+    # Gather last run data from log buffer
+    try:
+        buf = read_fn() if read_fn else _read_text(AGENT_LOG_BUFFER)
+        last_run_ts, emails_processed = _extract_last_run(buf)
+    except Exception as e:
+        print(f"  [agent-status] Warning: could not read log buffer: {e}")
+        last_run_ts, emails_processed = "unknown", "unknown"
+
+    scheduler_line = pause_description if is_paused else "Active  (runs every 4 hours)"
+
+    body = build_status_reply_body(
+        scheduler_line=scheduler_line,
+        accounts=accounts,
+        last_run_ts=last_run_ts,
+        emails_processed=emails_processed,
+    )
+
+    label_id = _get_or_create_label(service, AI_LABEL_NAME)
+
+    for msg_id in status_msg_ids:
+        send_status_reply(service, body)
+        # Consume the command email: mark read + AI Processed + archive
+        try:
+            gmail_execute(service.users().messages().modify(
+                userId="me", id=msg_id,
+                body={
+                    "removeLabelIds": ["UNREAD", "INBOX"],
+                    "addLabelIds":    [label_id] if label_id else [],
+                },
+            ))
+        except Exception as e:
+            print(f"  [agent-status] Warning: could not consume command {msg_id}: {e}")
+
+
+# sprint 22 — [AGENT IGNORE] / [AGENT UNIGNORE] handler
+def handle_ignore_commands(
+    service: Any,
+    ignore_cmds: list[tuple[str, str]],
+    unignore_cmds: list[tuple[str, str]],
+    account_id: str | None = None,
+) -> None:
+    """Process IGNORE and UNIGNORE command emails.
+
+    For each command: call block_sender or unblock_sender, then consume the
+    command email (mark read, label AI Processed, archive).
+    """
+    from fetch_emails import AGENT_IGNORE_SUBJECT, AGENT_UNIGNORE_SUBJECT
+
+    if not ignore_cmds and not unignore_cmds:
+        return
+
+    label_id = _get_or_create_label(service, AI_LABEL_NAME)
+
+    for msg_id, subject in ignore_cmds:
+        address = pre_filter.parse_ignore_address(subject, AGENT_IGNORE_SUBJECT)
+        if not address:
+            print(f"  [agent-ignore] command malformed — no address found, skipping")
+        else:
+            print(f"  [agent-ignore] IGNORE command detected — {address}")
+            status = pre_filter.block_sender(address, account_id=account_id)
+            print(f"  [agent-ignore] {status}")
+        _consume_command(service, msg_id, label_id)
+
+    for msg_id, subject in unignore_cmds:
+        address = pre_filter.parse_ignore_address(subject, AGENT_UNIGNORE_SUBJECT)
+        if not address:
+            print(f"  [agent-ignore] command malformed — no address found, skipping")
+        else:
+            print(f"  [agent-ignore] UNIGNORE command detected — {address}")
+            status = pre_filter.unblock_sender(address, account_id=account_id)
+            print(f"  [agent-ignore] {status}")
+        _consume_command(service, msg_id, label_id)
+
+
+# sprint 22 — [AGENT MODEL] helpers and handler
+
+def _get_account_model(account_id: str | None) -> str:
+    """Return the active model for this account.
+
+    Reads model_config_<id>.json if present; falls back to LOCAL_MODEL env var;
+    falls back to the compiled default.
+    """
+    config_path = account_file_path(MODEL_CONFIG_FILE, account_id)
+    try:
+        data = _read_json(config_path)
+        if data and data.get("model"):
+            return data["model"]
+    except Exception:
+        pass
+    return os.environ.get("LOCAL_MODEL", "llama3.1:latest")
+
+
+def _write_model_config(config_path: str, model_name: str) -> None:
+    """Write the per-account model config file."""
+    _write_json(config_path, {"model": model_name})
+
+
+def _make_ollama_client():
+    """Return an Ollama client using the configured host."""
+    import ollama
+    return ollama.Client(host=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
+
+
+def handle_model_command(
+    service: Any,
+    cmds: list[tuple[str, str]],
+    account_id: str | None = None,
+) -> None:
+    """Process [AGENT MODEL] command emails.
+
+    For each command: validate model name, check/pull from Ollama, write
+    per-account config on success. Errors are appended to the log buffer.
+    Command email is always consumed.
+    """
+    label_id  = _get_or_create_label(service, AI_LABEL_NAME)
+    buf_path  = account_file_path(AGENT_LOG_BUFFER, account_id)
+    backend   = os.environ.get("MODEL_BACKEND", "gemini").lower()
+
+    for msg_id, model_name in cmds:
+        try:
+            # Guard: Gemini accounts cannot use this command
+            if backend == "gemini":
+                print(f"  [agent-model] command ignored — account uses Gemini backend")
+                buf = _read_text(buf_path)
+                _write_text(buf_path, buf + f"  [AGENT MODEL] error — model switching is Ollama-only\n")
+                continue
+
+            # Guard: empty model name
+            if not model_name:
+                print(f"  [agent-model] command malformed — no model name found")
+                buf = _read_text(buf_path)
+                _write_text(buf_path, buf + f"  [AGENT MODEL] error — no model name in command\n")
+                continue
+
+            print(f"  [agent-model] MODEL command received — checking {model_name}")
+            client      = _make_ollama_client()
+            installed   = [m.model for m in client.list().models]
+            config_path = account_file_path(MODEL_CONFIG_FILE, account_id)
+
+            if model_name in installed:
+                print(f"  [agent-model] {model_name} already installed — switching")
+            else:
+                print(f"  [agent-model] {model_name} not found locally — pulling from Ollama...")
+                try:
+                    client.pull(model_name)
+                    print(f"  [agent-model] {model_name} pulled successfully — switching")
+                except Exception as pull_err:
+                    print(f"  [agent-model] pull failed — {model_name} not found: {pull_err}")
+                    buf = _read_text(buf_path)
+                    _write_text(buf_path, buf + f"  [AGENT MODEL] error — {model_name} could not be pulled: {pull_err}\n")
+                    continue  # skip config write
+
+            _write_model_config(config_path, model_name)
+            print(f"  [agent-model] model config updated")
+            buf = _read_text(buf_path)
+            _write_text(buf_path, buf + f"  [AGENT MODEL] switched to {model_name}\n")
+
+        except Exception as e:
+            print(f"  [agent-model] unexpected error: {e}")
+        finally:
+            _consume_command(service, msg_id, label_id)
+
+
+# sprint 22 — [AGENT DIGEST] on-demand report handler
+def handle_digest_command(
+    service: Any,
+    msg_ids: list[str],
+    account_id: str | None = None,
+) -> None:
+    """Send an on-demand Agent Report from the current buffer, then clear it.
+
+    Buffer is only cleared if send succeeds — protects against silent data loss.
+    """
+    buf_path = account_file_path(AGENT_LOG_BUFFER, account_id)
+    label_id = _get_or_create_label(service, AI_LABEL_NAME)
+
+    for msg_id in msg_ids:
+        print(f"[{account_id}] DIGEST command received — sending on-demand report")
+        buffer = _read_text(buf_path)
+        now = datetime.now()
+        date_str = now.strftime("%b %d, %Y")
+        body = build_digest_body(buffer, "on-demand", now)
+
+        try:
+            send_agent_report(service, "on-demand", body, date_str)
+            _write_text(buf_path, "")
+            print(f"[{account_id}] DIGEST sent — buffer cleared")
+        except Exception as e:
+            print(f"  [warning] DIGEST command failed — send error: {e}")
+
+        _consume_command(service, msg_id, label_id)
+
+
+def _consume_command(service: Any, msg_id: str, label_id: str | None) -> None:
+    """Mark a command email read, apply AI Processed label, and archive it."""
+    try:
+        gmail_execute(service.users().messages().modify(
+            userId="me", id=msg_id,
+            body={
+                "removeLabelIds": ["UNREAD", "INBOX"],
+                "addLabelIds":    [label_id] if label_id else [],
+            },
+        ))
+        print(f"  [agent-ignore] Command email consumed")
+    except Exception as e:
+        print(f"  [agent-ignore] Warning: could not consume command {msg_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -691,8 +1326,8 @@ def main():
     service = get_gmail_service()
     print("Authenticated.\n")
 
-    print("Fetching unread emails...")
-    emails = fetch_unread_emails(service)
+    print("Fetching emails to process...")
+    emails = fetch_unprocessed_emails(service)
     if not emails:
         return
 

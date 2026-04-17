@@ -8,14 +8,7 @@
   {
     "id": "gmail-work",
     "provider": "gmail",
-    "active": false,
+    "active": true,
     "token_file": "token_work.json"
-  },
-  {
-    "id": "hotmail-personal",
-    "provider": "outlook",
-    "active": false,
-    "client_id": "YOUR_AZURE_APP_CLIENT_ID",
-    "tenant_id": "consumers"
   }
 ]
